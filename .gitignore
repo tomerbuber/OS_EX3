@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+.idea/
+
+# Ignore IDE folders
+Atomic/.idea/
+Barrier/.idea/
+Sample Client/.idea/
