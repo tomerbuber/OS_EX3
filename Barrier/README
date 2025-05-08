@@ -1,0 +1,7 @@
+HUJI Operating Systems(67808): Ex3 - Multiple Use Barrier Demo
+
+Barrier.cpp & Barrier.h define a reusable barrier class using std::mutex and std::condition_variable.
+
+barrierdemo.cpp demonstrates how multiple threads synchronize using this barrier.
+
+Use make to build the demo, then run ./barrierdemo to observe the thread synchronization behavior.

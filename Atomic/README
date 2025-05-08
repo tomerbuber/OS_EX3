@@ -1,0 +1,7 @@
+HUJI Operating Systems(67808): Ex3 - Atomic variable demo
+
+atomicdemo.cpp demonstrates basic use of an atomic variable.
+atomicdemo_multivar.cpp shows how to work with multiple flags in a single 32-bit atomic variable.
+
+Use the Makefile to build both demos.
+Run with ./atomicdemo and ./atomicdemo_multivar.
