@@ -12,3 +12,8 @@ add_executable(atomicdemo
 add_executable(atomicdemo_multivar
         Atomic/atomicdemo_multivar.cpp)
 
+add_executable(MapReduceFrameWork
+MapReduceFramework.cpp
+MapReduceClient.h
+MapReduceFramework.h)
+
