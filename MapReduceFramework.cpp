@@ -39,8 +39,8 @@ struct Job {
 };
 
 struct ThreadContext {
-    int threadId;
-    Job *job;
+    int threadId; //TODO maybe make const
+    Job *job; //TODO maybe make const
     IntermediateVec *intermediateVec; // each thread stores its own output
 };
 
