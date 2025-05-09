@@ -1,6 +1,7 @@
 #include "MapReduceFramework.h"
 #include "Barrier.h"
 #include "MapReduceClient.h"
+#include "Constants.h"
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -60,7 +61,7 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
                            nullptr,
                            threadEntryPoint,
                            job->threadContexts[i]) != 0) {
-            std::cerr << "system error: failed to create thread\n";
+            std::cerr << THREAD_CREATION_ERROR;
             exit(1);
         }
     }
