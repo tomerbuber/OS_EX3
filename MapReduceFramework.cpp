@@ -7,13 +7,20 @@
 #include <iostream>
 #include <pthread.h>
 
+typedef struct ThreadContext ThreadContext;
+void* threadEntryPoint(void* arg);
+
 // We want to use raw pointers only
 struct Job {
-    const MapReduceClient* client;
-    const InputVec& inputVec;
-    OutputVec& outputVec;
-    JobState jobState; // contains stage and percentage
-    int multiThreadLevel; // number of threads
+    const MapReduceClient* client;       // client to use for the job
+    const InputVec& inputVec;            // input vector
+    OutputVec& outputVec;                // output vector
+    JobState jobState;                   // contains stage and percentage
+    int multiThreadLevel;                // number of threads
+    pthread_t* threads;                  // array of thread handles
+    ThreadContext** threadContexts;      // array of thread contexts
+    Barrier* barrier;                    // synchronization barrier
+    std::atomic<int> nextInputIndex;     // for dynamic input splitting
 
     // Constructor
     Job(const MapReduceClient* client,
@@ -24,8 +31,19 @@ struct Job {
           inputVec(inputVec),
           outputVec(outputVec),
           jobState{UNDEFINED_STAGE, 0},
-          multiThreadLevel(multiThreadLevel) {}
+          multiThreadLevel(multiThreadLevel),
+          threads(new pthread_t[multiThreadLevel]),
+          threadContexts(new ThreadContext*[multiThreadLevel]),
+          barrier(new Barrier(multiThreadLevel)),
+          nextInputIndex(0)
+    {}
 };
+
+struct ThreadContext {
+    int threadId;
+    Job* job;
+};
+
 
 JobHandle startMapReduceJob(const MapReduceClient& client,
                             const InputVec& inputVec,
@@ -34,11 +52,56 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     // Dynamically allocate Job on the heap
     Job* job = new Job(&client, inputVec, outputVec, multiThreadLevel);
 
-    // create threads and start the job
+    // Initialize thread contexts and start threads
+    for (int i = 0; i < multiThreadLevel; ++i) {
+        job->threadContexts[i] = new ThreadContext{i, job};
+
+        if (pthread_create(&job->threads[i],
+                           nullptr,
+                           threadEntryPoint,
+                           job->threadContexts[i]) != 0) {
+            std::cerr << "system error: failed to create thread\n";
+            exit(1);
+        }
+    }
 
    return job;
 }
 
-void emit2(K2* key, V2* value, void* context) {
-    // Will be implemented later
+void* threadEntryPoint(void* arg) {
+    auto* context = (ThreadContext*)arg;
+    Job* job = context->job;
+
+    // Example: run the map stage
+    while (true) {
+        int index = job->nextInputIndex.fetch_add(1);
+        if (index >= job->inputVec.size()) break;
+
+        auto& pair = job->inputVec[index];
+        job->client->map(pair.first, pair.second, context);
+        // context will be used by emit2
+    }
+        //sort ?
+
+    // Synchronize all threads before shuffle
+    job->barrier->barrier();
+
+    // shuffle
+
+    // Placeholder for reduce logic...
+
+    return nullptr;
 }
+
+void waitForJob(JobHandle jobHandle) {
+    Job* job = static_cast<Job*>(jobHandle);
+    for (int i = 0; i < job->multiThreadLevel; ++i) {
+        pthread_join(job->threads[i], nullptr);
+        delete job->threadContexts[i];
+    }
+    delete[] job->threads;
+    delete[] job->threadContexts;
+    delete job->barrier;
+    delete job;
+}
+
