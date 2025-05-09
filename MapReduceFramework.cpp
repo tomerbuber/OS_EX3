@@ -23,7 +23,7 @@ struct Job {
     Barrier *barrier;                    // synchronization barrier
     std::atomic<int> atomicIndex;        // for dynamic input splitting
     std::vector<IntermediateVec*> intermediateVectors; // Vector of Vectors of
-    // (K2, V2)     // for reduce phase
+    // (K2, V2) for reduce phase
     pthread_mutex_t jobMutex;
 
     // Constructor
@@ -53,10 +53,17 @@ void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext* context);
 void shuffling_func(Job* job);
 void pushSortedVecToJob(Job* job, IntermediateVec* vec);
+bool compareIntermediatePairs(const IntermediatePair &a, const
+                                IntermediatePair &b);
+void freeAll(JobHandle jobHandle);
+void lockMutex(Job* job);
+void unlockMutex(Job* job);
+
+
 
 struct ThreadContext {
-    int threadId; //TODO maybe make const
-    Job *job; //TODO maybe make const
+    const int threadId;
+    Job *job;
     IntermediateVec *intermediateVec; // each thread stores its own output
 };
 
@@ -200,7 +207,7 @@ void pushSortedVecToJob(ThreadContext* thread_context) {
     Job* job = thread_context->job;
 
     lockMutex(job);
-    job->intermediateVectors.push_back(vec);
+    job->intermediateVectors.push_back(thread_context->intermediateVec);
     unlockMutex(job);
 }
 
