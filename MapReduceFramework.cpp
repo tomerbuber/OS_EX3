@@ -11,7 +11,6 @@
 
 typedef struct ThreadContext ThreadContext;
 
-
 // We want to use raw pointers only
 struct Job {
     const MapReduceClient *client;       // client to use for the job
@@ -50,7 +49,6 @@ struct Job {
           }
 };
 
-
 void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext* context);
 void shuffling_func(Job* job);
@@ -62,6 +60,8 @@ struct ThreadContext {
     IntermediateVec *intermediateVec; // each thread stores its own output
 };
 
+
+// Starts a MapReduce job by creating the Job object and launching worker threads.
 JobHandle startMapReduceJob(const MapReduceClient &client,
                             const InputVec &inputVec,
                             OutputVec &outputVec,
@@ -87,6 +87,9 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
     return job;
 }
 
+
+// thread entry function: runs map, sorts intermediate results, syncs, and
+// performs shuffle if main thread
 void *threadEntryPoint(void *arg) {
     auto* threadContext = (ThreadContext*) arg;
     Job* job = threadContext->job;
@@ -130,15 +133,14 @@ void *threadEntryPoint(void *arg) {
     return nullptr;
 }
 
-
+/** sort */
 bool compareIntermediatePairs(const IntermediatePair &a, const IntermediatePair &b) {
     return *(a.first) < *(b.first);
 }
 
-/**
- * Sorts the intermediate (K2, V2) pairs produced by this thread’s map phase.
- * Sorting is done by key (K2), in-place.
- */
+
+//sorts (in place) the intermediate (K2, V2) pairs produced by this threads
+// map phase
 void sorting_func(ThreadContext* context) {
     std::sort(
         context->intermediateVec->begin(),
@@ -146,7 +148,7 @@ void sorting_func(ThreadContext* context) {
         compareIntermediatePairs);
 }
 
-
+//TODO: implement shuffling_func:
 void shuffling_func(Job* job) {
     getJobState(job, SHUFFLE_STAGE);
 
@@ -162,10 +164,13 @@ void shuffling_func(Job* job) {
 
 }
 
+// todo: implement
 void freeAll(JobHandle jobHandle){
     // need to free all
 }
 
+
+//Attempts to lock the job's mutex. If locking fails, free all
 void lockMutex(Job* job)
 {
     if (pthread_mutex_lock(&job->jobMutex) != SUCCESS)
@@ -176,6 +181,9 @@ void lockMutex(Job* job)
     }
 }
 
+
+
+//Attempts to unlock the job's mutex. If unlocking fails, free all
 void unlockMutex(Job* job)
 {
     if (pthread_mutex_unlock(&job->jobMutex) != SUCCESS)
@@ -187,13 +195,28 @@ void unlockMutex(Job* job)
 }
 
 
-void pushSortedVecToJob(Job* job, IntermediateVec* vec) {
+// Adds the sorted intermediate vector to the job's intermediate vectors
+void pushSortedVecToJob(ThreadContext* thread_context) {
+    Job* job = thread_context->job;
+
     lockMutex(job);
     job->intermediateVectors.push_back(vec);
     unlockMutex(job);
 }
 
-//
+
+// Called by the user's map function to emit an intermediate (key, value) pair.
+// It appends the pair to the calling thread's intermediate vector.
+void emit2(K2 *key, V2 *value, void *context) {
+    // Cast context back to ThreadContext*
+    auto *threadContext = (ThreadContext *) (context);
+
+    // Add the emitted pair to the thread's intermediate vector
+    IntermediatePair intermediatePair = std::make_pair(key, value);
+    threadContext->intermediateVec->push_back(intermediatePair);
+}
+
+//TODO: implement waitForJob:
 void waitForJob(JobHandle jobHandle) {
     auto *job = (Job *) (jobHandle);
     for (int i = 0; i < job->multiThreadLevel; ++i) {
@@ -205,13 +228,3 @@ void waitForJob(JobHandle jobHandle) {
     delete job->barrier;
     delete job;
 }
-
-void emit2(K2 *key, V2 *value, void *context) {
-    // Cast context back to ThreadContext*
-    auto *threadContext = (ThreadContext *) (context);
-
-    // Add the emitted pair to the thread's intermediate vector
-    IntermediatePair intermediatePair = std::make_pair(key, value);
-    threadContext->intermediateVec->push_back(intermediatePair);
-}
-
