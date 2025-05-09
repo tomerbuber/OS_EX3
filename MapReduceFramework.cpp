@@ -8,24 +8,24 @@
 #include <pthread.h>
 
 typedef struct ThreadContext ThreadContext;
-void* threadEntryPoint(void* arg);
+void *threadEntryPoint(void *arg);
 
 // We want to use raw pointers only
 struct Job {
-    const MapReduceClient* client;       // client to use for the job
-    const InputVec& inputVec;            // input vector
-    OutputVec& outputVec;                // output vector
+    const MapReduceClient *client;       // client to use for the job
+    const InputVec &inputVec;            // input vector
+    OutputVec &outputVec;                // output vector
     JobState jobState;                   // contains stage and percentage
     int multiThreadLevel;                // number of threads
-    pthread_t* threads;                  // array of thread handles
-    ThreadContext** threadContexts;      // array of thread contexts
-    Barrier* barrier;                    // synchronization barrier
+    pthread_t *threads;                  // array of thread handles
+    ThreadContext **threadContexts;      // array of thread contexts
+    Barrier *barrier;                    // synchronization barrier
     std::atomic<int> nextInputIndex;     // for dynamic input splitting
 
     // Constructor
-    Job(const MapReduceClient* client,
-        const InputVec& inputVec,
-        OutputVec& outputVec,
+    Job(const MapReduceClient *client,
+        const InputVec &inputVec,
+        OutputVec &outputVec,
         int multiThreadLevel)
         : client(client),
           inputVec(inputVec),
@@ -33,28 +33,28 @@ struct Job {
           jobState{UNDEFINED_STAGE, 0},
           multiThreadLevel(multiThreadLevel),
           threads(new pthread_t[multiThreadLevel]),
-          threadContexts(new ThreadContext*[multiThreadLevel]),
+          threadContexts(new ThreadContext *[multiThreadLevel]),
           barrier(new Barrier(multiThreadLevel)),
-          nextInputIndex(0)
-    {}
+          nextInputIndex(0) {}
 };
 
 struct ThreadContext {
     int threadId;
-    Job* job;
+    Job *job;
+    IntermediateVec *intermediateVec; // each thread stores its own output
 };
 
-
-JobHandle startMapReduceJob(const MapReduceClient& client,
-                            const InputVec& inputVec,
-                            OutputVec& outputVec,
+JobHandle startMapReduceJob(const MapReduceClient &client,
+                            const InputVec &inputVec,
+                            OutputVec &outputVec,
                             int multiThreadLevel) {
     // Dynamically allocate Job on the heap
-    Job* job = new Job(&client, inputVec, outputVec, multiThreadLevel);
+    Job *job = new Job(&client, inputVec, outputVec, multiThreadLevel);
 
     // Initialize thread contexts and start threads
     for (int i = 0; i < multiThreadLevel; ++i) {
-        job->threadContexts[i] = new ThreadContext{i, job};
+        job->threadContexts[i] = new ThreadContext{i, job,
+                                                   new IntermediateVec()};
 
         if (pthread_create(&job->threads[i],
                            nullptr,
@@ -65,36 +65,47 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
         }
     }
 
-   return job;
+    return job;
 }
 
-void* threadEntryPoint(void* arg) {
-    auto* context = (ThreadContext*)arg;
-    Job* job = context->job;
+void *threadEntryPoint(void *arg) {
+    auto *context = (ThreadContext *) arg;
+    Job *job = context->job;
 
     // Example: run the map stage
+
+    // mapping -> fix this. should not be while true
     while (true) {
         int index = job->nextInputIndex.fetch_add(1);
-        if (index >= job->inputVec.size()) break;
+        if (index >= job->inputVec.size()) {
+            break;
+        }
 
-        auto& pair = job->inputVec[index];
+        auto &pair = job->inputVec[index];
         job->client->map(pair.first, pair.second, context);
         // context will be used by emit2
+
     }
-        //sort ?
+
+    // NOW sort
+
 
     // Synchronize all threads before shuffle
     job->barrier->barrier();
 
+    // if this is the main thread ... do shuffle
+
     // shuffle
 
-    // Placeholder for reduce logic...
+    // barrier
+
+    // reduce
 
     return nullptr;
 }
 
 void waitForJob(JobHandle jobHandle) {
-    Job* job = static_cast<Job*>(jobHandle);
+    auto *job = (Job *) (jobHandle);
     for (int i = 0; i < job->multiThreadLevel; ++i) {
         pthread_join(job->threads[i], nullptr);
         delete job->threadContexts[i];
@@ -103,5 +114,14 @@ void waitForJob(JobHandle jobHandle) {
     delete[] job->threadContexts;
     delete job->barrier;
     delete job;
+}
+
+void emit2(K2 *key, V2 *value, void *context) {
+    // Cast context back to ThreadContext*
+    auto *threadContext = (ThreadContext *) (context);
+
+    // Add the emitted pair to the thread's intermediate vector
+    IntermediatePair intermediatePair = std::make_pair(key, value);
+    threadContext->intermediateVec->push_back(intermediatePair);
 }
 
