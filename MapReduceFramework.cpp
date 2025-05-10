@@ -52,7 +52,10 @@ struct Job {
 void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext* context);
 void shuffling_func(Job* job);
-void pushSortedVecToJob(Job* job, IntermediateVec* vec);
+
+template<typename VecType, typename ItemType>
+void pushToJobVector(ThreadContext* context, VecType& vec, const ItemType& item);
+
 bool compareIntermediatePairs(const IntermediatePair &a, const
                                 IntermediatePair &b);
 void freeAll(JobHandle jobHandle);
@@ -66,6 +69,15 @@ struct ThreadContext {
     Job *job;
     IntermediateVec *intermediateVec; // each thread stores its own output
 };
+
+
+// Gets the current job state and updates the job's state
+template<typename VecType, typename ItemType>
+void pushToJobVector(ThreadContext* context, VecType& vec, const ItemType& item) {
+    lockMutex(context->job);
+    vec.push_back(item);
+    unlockMutex(context->job);
+}
 
 
 // Starts a MapReduce job by creating the Job object and launching worker threads.
@@ -121,7 +133,8 @@ void *threadEntryPoint(void *arg) {
     sorting_func(threadContext);
 
     // Pushing the sorted vector into the jobVectors via Mutex
-    pushSortedVecToJob(job, threadContext->intermediateVec);
+    pushToJobVector(threadContext, job->intermediateVectors, threadContext->intermediateVec);
+
 
     // Synchronize all threads before shuffle
     job->barrier->barrier();
@@ -197,14 +210,7 @@ void unlockMutex(Job* job)
     }
 }
 
-// Adds the sorted intermediate vector to the job's intermediate vectors
-void pushSortedVecToJob(ThreadContext* thread_context) {
-    Job* job = thread_context->job;
 
-    lockMutex(job);
-    job->intermediateVectors.push_back(thread_context->intermediateVec);
-    unlockMutex(job);
-}
 
 // Called by the user's map function to emit an intermediate (key, value) pair.
 // It appends the pair to the calling thread's intermediate vector.
@@ -221,10 +227,8 @@ void emit2(K2 *key, V2 *value, void *context) {
 void emit3 (K3 *key, V3 *value, void *context) {
     auto *threadContext = (ThreadContext *) (context);
     // Add the emitted pair to the job's output vector
-    lockMutex(threadContext->job);
-    OutputPair outputPair = std::make_pair(key, value);
-    threadContext->job->outputVec.push_back(outputPair);
-    unlockMutex(threadContext->job);
+    pushToJobVector(threadContext, threadContext->job->outputVec, std::make_pair(key, value));
+
 }
 
 //TODO: implement waitForJob:
