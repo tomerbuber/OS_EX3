@@ -53,11 +53,8 @@ void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext* context);
 void shuffling_func(Job* job);
 
-template<typename VecType, typename ItemType>
-void pushToJobVector(ThreadContext* context, VecType& vec, const ItemType& item);
-
 bool compareIntermediatePairs(const IntermediatePair &a, const
-                                IntermediatePair &b);
+IntermediatePair &b);
 void freeAll(JobHandle jobHandle);
 void lockMutex(Job* job);
 void unlockMutex(Job* job);
