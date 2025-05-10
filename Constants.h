@@ -8,7 +8,7 @@
 #define ERROR (-1)
 #define SUCCESS 0
 #define MAIN_THREAD_ID 0
-
-#define THREAD_CREATION_ERROR "system error: failed to create thread\n";
+#define MUTEX_INITIALIZED true
+#define MUTEX_NOT_INITIALIZED false
 
 #endif //_CONSTANTS_H_

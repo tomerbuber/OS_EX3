@@ -8,10 +8,13 @@
 #include <iostream>
 #include <pthread.h>
 #include <algorithm>
+#include <queue>
+#include <set>
 
 typedef struct ThreadContext ThreadContext;
+typedef std::set<K2 *, bool (*)(K2 *, K2 *)> SortedSetK2;
 
-// We want to use raw pointers only
+/** Job structure holding all data and sync tools for MapReduce. */
 struct Job {
     const MapReduceClient *client;       // client to use for the job
     const InputVec &inputVec;            // input vector
@@ -22,7 +25,7 @@ struct Job {
     ThreadContext **threadContexts;      // array of thread contexts
     Barrier *barrier;                    // synchronization barrier
     std::atomic<int> atomicIndex;        // for dynamic input splitting
-    std::vector<IntermediateVec*> intermediateVectors; // Vector of Vectors of
+    std::vector<IntermediateVec *> intermediateVectors; // Vector of Vectors of
     // (K2, V2) for reduce phase
     pthread_mutex_t jobMutex;
 
@@ -40,50 +43,52 @@ struct Job {
           threadContexts(new ThreadContext *[multiThreadLevel]),
           barrier(new Barrier(multiThreadLevel)),
           atomicIndex(0),
-          intermediateVectors()
-          {
-              // Allocate one IntermediateVec* per thread
-              for (int i = 0; i < multiThreadLevel; ++i) {
-                  intermediateVectors.push_back(new IntermediateVec());
-              }
-          }
+          intermediateVectors() {
+
+        //todo: reset counters or something
+
+    }
 };
 
 void *threadEntryPoint(void *arg);
-void sorting_func(ThreadContext* context);
-void shuffling_func(Job* job);
-
+void sorting_func(ThreadContext *context);
+void shuffling_func(Job *job);
+SortedSetK2 createKeysSorted(Job *job);
 bool compareIntermediatePairs(const IntermediatePair &a, const
 IntermediatePair &b);
-void freeAll(JobHandle jobHandle);
-void lockMutex(Job* job);
-void unlockMutex(Job* job);
+void freeAll(JobHandle jobHandle, bool isMutexInitialized);
+void lockMutex(Job *job);
+void unlockMutex(Job *job);
 
-
-
+void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec);
 struct ThreadContext {
     const int threadId;
     Job *job;
     IntermediateVec *intermediateVec; // each thread stores its own output
 };
 
-
 // Gets the current job state and updates the job's state
 template<typename VecType, typename ItemType>
-void pushToJobVector(ThreadContext* context, VecType& vec, const ItemType& item) {
+void pushToJobVector(ThreadContext *context, VecType &vec, const ItemType
+&item) {
     lockMutex(context->job);
     vec.push_back(item);
     unlockMutex(context->job);
 }
 
-
-// Starts a MapReduce job by creating the Job object and launching worker threads.
+/** Starts the MapReduce job and creates worker threads. */
 JobHandle startMapReduceJob(const MapReduceClient &client,
                             const InputVec &inputVec,
                             OutputVec &outputVec,
                             int multiThreadLevel) {
     // Dynamically allocate Job on the heap
     Job *job = new Job(&client, inputVec, outputVec, multiThreadLevel);
+
+    if (pthread_mutex_init(&job->jobMutex, nullptr) != 0) {
+        std::cout << "system error: mutex creating failed" << std::endl;
+        freeAll(job, MUTEX_NOT_INITIALIZED);
+        exit(ERROR);
+    }
 
 
     // Initialize thread contexts and start threads
@@ -95,19 +100,18 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
                            nullptr,
                            threadEntryPoint,
                            job->threadContexts[i]) != 0) {
-            std::cerr << THREAD_CREATION_ERROR;
-            exit(1);
+            std::cerr << "system error: failed to create thread\n";
+            exit(ERROR);
         }
     }
 
     return job;
 }
 
-// thread entry function: runs map, sorts intermediate results, syncs, and
-// performs shuffle if main thread
+/** Entry point for each worker thread. */
 void *threadEntryPoint(void *arg) {
-    auto* threadContext = (ThreadContext*) arg;
-    Job* job = threadContext->job;
+    auto *threadContext = (ThreadContext *) arg;
+    Job *job = threadContext->job;
 
     while (true) {
         // Atomically get the next available index in the input vector
@@ -120,7 +124,7 @@ void *threadEntryPoint(void *arg) {
         }
 
         // Get the (K1*, V1*) pair at the current index
-        auto& pair = job->inputVec[index];
+        auto &pair = job->inputVec[index];
 
         // Call the user's map function with the key, value, and thread context
         // The user's implementation is expected to call emit2 from here
@@ -137,7 +141,7 @@ void *threadEntryPoint(void *arg) {
     job->barrier->barrier();
 
     // if this is the main thread Continue. The others finished their tasks
-    if (threadContext->threadId == MAIN_THREAD_ID){
+    if (threadContext->threadId == MAIN_THREAD_ID) {
 
         shuffling_func(job);
 
@@ -149,15 +153,14 @@ void *threadEntryPoint(void *arg) {
     return nullptr;
 }
 
-/** sort */
-bool compareIntermediatePairs(const IntermediatePair &a, const IntermediatePair &b) {
+/** Compares two intermediate pairs by key. */
+bool compareIntermediatePairs(const IntermediatePair &a,
+                              const IntermediatePair &b) {
     return *(a.first) < *(b.first);
 }
 
-
-//sorts (in place) the intermediate (K2, V2) pairs produced by this threads
-// map phase
-void sorting_func(ThreadContext* context) {
+/** Sorts the thread's intermediate (K2, V2) vector. */
+void sorting_func(ThreadContext *context) {
     std::sort(
         context->intermediateVec->begin(),
         context->intermediateVec->end(),
@@ -165,52 +168,92 @@ void sorting_func(ThreadContext* context) {
 }
 
 //TODO: implement shuffling_func:
-void shuffling_func(Job* job) {
+/** Merges and sorts all intermediate results (main thread only). */
+void shuffling_func(Job *job) {
+
     getJobState(job, SHUFFLE_STAGE);
 
-    auto& allVecs = job->threadContexts;
+    std::vector<std::vector<IntermediatePair>> mergedVectors;
 
-    std::vector<IntermediatePair> merged;
+    SortedSetK2 keysSorted = createKeysSorted(job);
+    for (K2 *key: keysSorted) {
+        IntermediateVec *vec = new IntermediateVec();
+        createVectorFromKey(job, key, vec);
+        mergedVectors.push_back(*vec);
+    }
 
-    // merge all vectors into one vector which is sorted
+    // Merge all thread intermediate vectors
     for (int i = 0; i < job->multiThreadLevel; ++i) {
-        auto* vec = allVecs[i]->intermediateVec;
+        IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
         merged.insert(merged.end(), vec->begin(), vec->end());
     }
 
+    // Sort merged vector by key
+    std::sort(merged.begin(), merged.end(), compareIntermediatePairs);
+
+    // Store merged & sorted vector in a new IntermediateVec* (for reduce phase)
+    auto *sortedVec = new IntermediateVec(std::move(merged));
+
+    // Push to job->intermediateVectors as the single reduce input
+    pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->intermediateVectors, sortedVec);
 }
+
+/** Compares two K2 keys for equality. */
+bool equalsK2(K2 *a, K2 *b) {
+    return !((*a < *b) && (*b < *a));
+}
+
+void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec) {
+    // Iterate through all intermediate vectors and find the matching key
+    for (int i = 0; i < job->multiThreadLevel; ++i) {
+        IntermediateVec *intermediateVec = job->intermediateVectors[i];
+        for (const auto &pair: *intermediateVec) {
+
+            if (equalsK2(pair.first, k2)) {
+                afterShuffleVec->push_back(pair);
+            }
+            if (*k2 < *(pair.first)) {
+                // No need to check further, as the keys are sorted
+                break;
+            }
+        }
+    }
+}
+
 
 // todo: implement
-void freeAll(JobHandle jobHandle){
+/** Frees all job resources; destroys mutex if initialized. */
+void freeAll(Job *job, bool isMutexInitialized) {
     // need to free all
+    bool failed = false;
+    if (isMutexInitialized) {
+        if (pthread_mutex_destroy(&job->jobMutex) != 0) {
+            std::cout << "system error: mutex destroy failed" << std::endl;
+            failed = true;
+        }
+    }
+
 }
 
-//Attempts to lock the job's mutex. If locking fails, free all
-void lockMutex(Job* job)
-{
-    if (pthread_mutex_lock(&job->jobMutex) != SUCCESS)
-    {
-        std::cout <<"system error: mutex lock failed"<<std::endl;
-        freeAll(job);
+/** Locks the job's mutex or exits on failure. */
+void lockMutex(Job *job) {
+    if (pthread_mutex_lock(&job->jobMutex) != SUCCESS) {
+        std::cout << "system error: mutex lock failed" << std::endl;
+        freeAll(job, MUTEX_INITIALIZED);
         exit(ERROR);
     }
 }
 
-//Attempts to unlock the job's mutex. If unlocking fails, free all
-void unlockMutex(Job* job)
-{
-    if (pthread_mutex_unlock(&job->jobMutex) != SUCCESS)
-    {
-        std::cout <<"system error: mutex unlock failed"<<std::endl;
-        freeAll(job);
+/** Unlocks the job's mutex or exits on failure. */
+void unlockMutex(Job *job) {
+    if (pthread_mutex_unlock(&job->jobMutex) != SUCCESS) {
+        std::cout << "system error: mutex unlock failed" << std::endl;
+        freeAll(job, MUTEX_NOT_INITIALIZED);
         exit(ERROR);
     }
 }
 
-
-
-// Called by the user's map function to emit an intermediate (key, value) pair.
-// It appends the pair to the calling thread's intermediate vector.
+/** Emits a (K2, V2) pair during map phase to thread-local storage. */
 void emit2(K2 *key, V2 *value, void *context) {
     // Cast context back to ThreadContext*
     auto *threadContext = (ThreadContext *) (context);
@@ -220,8 +263,8 @@ void emit2(K2 *key, V2 *value, void *context) {
     threadContext->intermediateVec->push_back(intermediatePair);
 }
 
-// Emits a (K3, V3) pair from reduce phase into the final output vector (thread-safe).
-void emit3 (K3 *key, V3 *value, void *context) {
+/** Emits a (K3, V3) pair during reduce phase to output vector. */
+void emit3(K3 *key, V3 *value, void *context) {
     auto *threadContext = (ThreadContext *) (context);
     // Add the emitted pair to the job's output vector
     pushToJobVector(threadContext, threadContext->job->outputVec, std::make_pair(key, value));
@@ -229,6 +272,7 @@ void emit3 (K3 *key, V3 *value, void *context) {
 }
 
 //TODO: implement waitForJob:
+/** Waits for all threads to finish and frees thread contexts. */
 void waitForJob(JobHandle jobHandle) {
     auto *job = (Job *) (jobHandle);
     for (int i = 0; i < job->multiThreadLevel; ++i) {
@@ -239,4 +283,30 @@ void waitForJob(JobHandle jobHandle) {
     delete[] job->threadContexts;
     delete job->barrier;
     delete job;
+}
+
+/** Closes and frees all job-related resources. */
+void closeJobHandle(JobHandle job) {
+    waitForJob(job);
+    freeAll(job, MUTEX_INITIALIZED);
+}
+
+/** Comparator function for sorting K2* keys by value. */
+bool k2Comparator(K2 *a, K2 *b) {
+    return *a < *b;
+}
+
+/** Creates a sorted set of unique keys from intermediate vectors. */
+SortedSetK2 createKeysSorted(Job *job) {
+    // Create a set to store unique keys, sorted by the comparator function ptr
+    SortedSetK2 keysSorted(k2Comparator);
+
+    // Iterate through all intermediate vectors and insert keys into the set
+    for (int i = 0; i < job->multiThreadLevel; ++i) {
+        for (auto &pair: *job->intermediateVectors[i]) {
+            keysSorted.insert(pair.first);
+        }
+    }
+
+    return keysSorted;
 }
