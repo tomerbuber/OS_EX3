@@ -94,7 +94,6 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
     return job;
 }
 
-
 // thread entry function: runs map, sorts intermediate results, syncs, and
 // performs shuffle if main thread
 void *threadEntryPoint(void *arg) {
@@ -176,7 +175,6 @@ void freeAll(JobHandle jobHandle){
     // need to free all
 }
 
-
 //Attempts to lock the job's mutex. If locking fails, free all
 void lockMutex(Job* job)
 {
@@ -187,8 +185,6 @@ void lockMutex(Job* job)
         exit(ERROR);
     }
 }
-
-
 
 //Attempts to unlock the job's mutex. If unlocking fails, free all
 void unlockMutex(Job* job)
@@ -201,7 +197,6 @@ void unlockMutex(Job* job)
     }
 }
 
-
 // Adds the sorted intermediate vector to the job's intermediate vectors
 void pushSortedVecToJob(ThreadContext* thread_context) {
     Job* job = thread_context->job;
@@ -210,7 +205,6 @@ void pushSortedVecToJob(ThreadContext* thread_context) {
     job->intermediateVectors.push_back(thread_context->intermediateVec);
     unlockMutex(job);
 }
-
 
 // Called by the user's map function to emit an intermediate (key, value) pair.
 // It appends the pair to the calling thread's intermediate vector.
@@ -221,6 +215,16 @@ void emit2(K2 *key, V2 *value, void *context) {
     // Add the emitted pair to the thread's intermediate vector
     IntermediatePair intermediatePair = std::make_pair(key, value);
     threadContext->intermediateVec->push_back(intermediatePair);
+}
+
+// Emits a (K3, V3) pair from reduce phase into the final output vector (thread-safe).
+void emit3 (K3 *key, V3 *value, void *context) {
+    auto *threadContext = (ThreadContext *) (context);
+    // Add the emitted pair to the job's output vector
+    lockMutex(threadContext->job);
+    OutputPair outputPair = std::make_pair(key, value);
+    threadContext->job->outputVec.push_back(outputPair);
+    unlockMutex(threadContext->job);
 }
 
 //TODO: implement waitForJob:
