@@ -14,6 +14,18 @@
 typedef struct ThreadContext ThreadContext;
 typedef std::set<K2 *, bool (*)(K2 *, K2 *)> SortedSetK2;
 
+#define STAGE_SHIFT 62
+#define TOTAL_SHIFT 31
+#define COUNT_MASK 0x7fffffff
+
+#define ENCODE_JOB_PROGRESS(stage, total, count) \
+    (((uint64_t)(stage) << STAGE_SHIFT) | ((uint64_t)(total) << TOTAL_SHIFT) | (uint64_t)(count))
+
+#define DECODE_STAGE(x) ((stage_t)((x) >> STAGE_SHIFT))
+#define DECODE_TOTAL(x) (((x) >> TOTAL_SHIFT) & COUNT_MASK)
+#define DECODE_FINISHED(x) ((x) & COUNT_MASK)
+
+
 /** Job structure holding all data and sync tools for MapReduce. */
 struct Job {
     const MapReduceClient *client;       // client to use for the job
@@ -26,6 +38,8 @@ struct Job {
     Barrier *barrier;                    // synchronization barrier
     std::atomic<int> atomicIndex;        // for dynamic input splitting
     std::atomic<int> shuffleGroupCount;  // for shuffle phase
+    std::atomic<uint64_t> jobProgress;   // for progress tracking(bit mask)
+
 
     std::vector<IntermediateVec *> intermediateVectors; // Vector of Vectors of
     // (K2, V2) for reduce phase
@@ -210,7 +224,7 @@ void sorting_func(ThreadContext *context) {
 /** Shuffle phase: groups by key, largest to smallest, popping from sorted vectors. */
 void shuffling_func(Job* job) {
     // Set job state to SHUFFLE_STAGE
-    getJobState(job, SHUFFLE_STAGE);
+    getJobState(job, &job->jobState);
 
     while (true) {
         K2* currentMaxKey = nullptr;
@@ -246,6 +260,7 @@ void shuffling_func(Job* job) {
     }
 
     // Done shuffling; reduce phase begins next
+
 
 }
 
@@ -363,8 +378,17 @@ SortedSetK2 createKeysSorted(Job *job) {
 }
 
 /** Gets the current job state and updates the job's state. */
-void getJobState(JobHandle jobHandle, stage_t stage) {
-    auto *job = (Job *) (jobHandle);
-    job->jobState.stage = stage;
-    job->jobState.percentage = 0.0f; // TODO: implement percentage calculation
+void getJobState(JobHandle job, JobState* state) {
+    auto* j = (Job*)job;
+    uint64_t x = j->jobProgress.load();
+    state->stage = DECODE_STAGE(x);
+    int total = DECODE_TOTAL(x);
+    int done = DECODE_FINISHED(x);
+    state->percentage = total == 0 ? 0 : ((float)done / total) * 100.0f;
+//
+//    // Update the job's state
+//    j->jobState.stage = state->stage;
+//    j->jobState.percentage = state->percentage;
 }
+
+
