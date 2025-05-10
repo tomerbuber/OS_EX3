@@ -25,6 +25,8 @@ struct Job {
     ThreadContext **threadContexts;      // array of thread contexts
     Barrier *barrier;                    // synchronization barrier
     std::atomic<int> atomicIndex;        // for dynamic input splitting
+    std::atomic<int> shuffleGroupCount;  // for shuffle phase
+
     std::vector<IntermediateVec *> intermediateVectors; // Vector of Vectors of
     // (K2, V2) for reduce phase
     pthread_mutex_t jobMutex;
@@ -43,6 +45,7 @@ struct Job {
           threadContexts(new ThreadContext *[multiThreadLevel]),
           barrier(new Barrier(multiThreadLevel)),
           atomicIndex(0),
+            shuffleGroupCount(0),
           intermediateVectors() {
 
         //todo: reset counters or something
@@ -89,7 +92,6 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
         freeAll(job, MUTEX_NOT_INITIALIZED);
         exit(ERROR);
     }
-
 
     // Initialize thread contexts and start threads
     for (int i = 0; i < multiThreadLevel; ++i) {
@@ -169,34 +171,84 @@ void sorting_func(ThreadContext *context) {
 
 //TODO: implement shuffling_func:
 /** Merges and sorts all intermediate results (main thread only). */
-void shuffling_func(Job *job) {
+//void shuffling_func(Job *job) {
+//
+//    // set the job state to shuffle
+//    getJobState(job, SHUFFLE_STAGE);
+//
+//    std::vector<std::vector<IntermediatePair>> mergedVectors;
+//
+//    //get all keys from all intermediate vectors
+//    SortedSetK2 keysSorted = createKeysSorted(job);
+//
+//
+//    for (K2 *key: keysSorted) {
+//        // Create a new IntermediateVec for each unique key
+//        IntermediateVec *vec = new IntermediateVec();
+//        createVectorFromKey(job, key, vec);
+//        // Push the vector to the mergedVectors
+//        mergedVectors.push_back(*vec);
+//    }
+//
+//    // Merge all thread intermediate vectors
+//    for (int i = 0; i < job->multiThreadLevel; ++i) {
+//        IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
+//        merged.insert(merged.end(), vec->begin(), vec->end());
+//    }
+//
+//    // Sort merged vector by key
+//    std::sort(merged.begin(), merged.end(), compareIntermediatePairs);
+//
+//    // Store merged & sorted vector in a new IntermediateVec* (for reduce phase)
+//    auto *sortedVec = new IntermediateVec(std::move(merged));
+//
+//    // Push to job->intermediateVectors as the single reduce input
+//    pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->intermediateVectors, sortedVec);
+//}
 
+
+/** Shuffle phase: groups by key, largest to smallest, popping from sorted vectors. */
+void shuffling_func(Job* job) {
+    // Set job state to SHUFFLE_STAGE
     getJobState(job, SHUFFLE_STAGE);
 
-    std::vector<std::vector<IntermediatePair>> mergedVectors;
+    while (true) {
+        K2* currentMaxKey = nullptr;
 
-    SortedSetK2 keysSorted = createKeysSorted(job);
-    for (K2 *key: keysSorted) {
-        IntermediateVec *vec = new IntermediateVec();
-        createVectorFromKey(job, key, vec);
-        mergedVectors.push_back(*vec);
+       // find max key at back of any vector
+        for (int i = 0; i < job->multiThreadLevel; ++i) {
+            IntermediateVec* vec = job->threadContexts[i]->intermediateVec;
+            if (!vec->empty()) {
+                K2* candidate = vec->back().first;
+                if (!currentMaxKey || *currentMaxKey < *candidate) {
+                    currentMaxKey = candidate;
+                }
+            }
+        }
+
+        if (!currentMaxKey) break; // all vectors are empty
+
+        //collect all values for this key
+        auto* grouped = new IntermediateVec();
+        for (int i = 0; i < job->multiThreadLevel; ++i) {
+            IntermediateVec* vec = job->threadContexts[i]->intermediateVec;
+            while (!vec->empty() &&
+                   !(*vec->back().first < *currentMaxKey) &&
+                   !(*currentMaxKey < *vec->back().first)) {
+                grouped->push_back(vec->back());
+                vec->pop_back();
+            }
+        }
+
+        //store group and update counter
+        pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->intermediateVectors, grouped);
+        job->shuffleGroupCount.fetch_add(1); // atomic increment
     }
 
-    // Merge all thread intermediate vectors
-    for (int i = 0; i < job->multiThreadLevel; ++i) {
-        IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
-        merged.insert(merged.end(), vec->begin(), vec->end());
-    }
+    // Done shuffling; reduce phase begins next
 
-    // Sort merged vector by key
-    std::sort(merged.begin(), merged.end(), compareIntermediatePairs);
-
-    // Store merged & sorted vector in a new IntermediateVec* (for reduce phase)
-    auto *sortedVec = new IntermediateVec(std::move(merged));
-
-    // Push to job->intermediateVectors as the single reduce input
-    pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->intermediateVectors, sortedVec);
 }
+
 
 /** Compares two K2 keys for equality. */
 bool equalsK2(K2 *a, K2 *b) {
@@ -219,7 +271,6 @@ void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec) {
         }
     }
 }
-
 
 // todo: implement
 /** Frees all job resources; destroys mutex if initialized. */
@@ -309,4 +360,11 @@ SortedSetK2 createKeysSorted(Job *job) {
     }
 
     return keysSorted;
+}
+
+/** Gets the current job state and updates the job's state. */
+void getJobState(JobHandle jobHandle, stage_t stage) {
+    auto *job = (Job *) (jobHandle);
+    job->jobState.stage = stage;
+    job->jobState.percentage = 0.0f; // TODO: implement percentage calculation
 }
