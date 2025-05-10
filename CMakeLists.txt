@@ -15,5 +15,8 @@ add_executable(atomicdemo_multivar
 add_executable(MapReduceFrameWork
 MapReduceFramework.cpp
 MapReduceClient.h
-MapReduceFramework.h)
+MapReduceFramework.h
+        Barrier/Barrier.h
+        Barrier/Barrier.cpp
+        "Sample Client/SampleClient.cpp")
 
