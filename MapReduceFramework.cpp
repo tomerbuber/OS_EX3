@@ -133,7 +133,8 @@ void *threadEntryPoint(void *arg) {
 
     while (true) {
         int index = job->atomicIndex.fetch_add(1);
-        if (index >= job->inputVec.size()) break;
+        // check if all input pairs have been processed
+        if (index >= static_cast<int>(job->inputVec.size())) break;
 
         auto &pair = job->inputVec[index];
         job->client->map(pair.first, pair.second, threadContext);
@@ -144,6 +145,7 @@ void *threadEntryPoint(void *arg) {
         job->jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE, total, done));
     }
 
+    // Wait for all threads to finish the map phase
     sorting_func(threadContext);
     pushToJobVector(threadContext, job->shuffledVectors, threadContext->intermediateVec);
 
@@ -287,11 +289,11 @@ void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec) {
 /** Frees all job resources; destroys mutex if initialized. */
 void freeAll(Job *job, bool isMutexInitialized) {
     // need to free all
-    bool failed = false;
+//    bool failed = false;
     if (isMutexInitialized) {
         if (pthread_mutex_destroy(&job->jobMutex) != 0) {
             std::cout << "system error: mutex destroy failed" << std::endl;
-            failed = true;
+//            failed = true;
         }
     }
 

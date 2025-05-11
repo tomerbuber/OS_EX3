@@ -1,6 +1,6 @@
 # Compiler
 CXX = g++
-CXXFLAGS = -Wall -std=c++11 -O3
+CXXFLAGS = -Wall -std=c++11 -O3 -IBarrier -IAtomic
 
 # Library name
 LIBRARY = libMapReduceFramework.a
