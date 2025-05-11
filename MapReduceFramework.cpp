@@ -41,11 +41,10 @@ struct Job {
     Barrier *barrier;                    // synchronization barrier
     std::atomic<int> atomicIndex;        // for dynamic input splitting
     std::atomic<int> shuffleGroupCount;  // for shuffle phase
-    std::atomic<uint64_t> jobProgress;   // for progress tracking(bit mask)
+    std::atomic<int> reducedGroups;      // tracks how many groups reduced
+    std::atomic<uint64_t> jobProgress;   // for progress tracking (bit mask)
 
-
-    std::vector<IntermediateVec *> shuffledVectors; // Vector of Vectors of
-    // (K2, V2) for reduce phase
+    std::vector<IntermediateVec *> shuffledVectors; // Vector of vectors of (K2, V2)
     pthread_mutex_t jobMutex;
 
     // Constructor
@@ -63,12 +62,11 @@ struct Job {
           barrier(new Barrier(multiThreadLevel)),
           atomicIndex(0),
           shuffleGroupCount(0),
-          shuffledVectors() {
-
-        //todo: reset counters or something
-
-    }
+          reducedGroups(0),
+          jobProgress(0),
+          shuffledVectors() {}
 };
+
 
 void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext *context);
@@ -134,46 +132,33 @@ void *threadEntryPoint(void *arg) {
     Job *job = threadContext->job;
 
     while (true) {
-        // Atomically get the next available index in the input vector
-        // and increment the shared counter for other threads
         int index = job->atomicIndex.fetch_add(1);
+        if (index >= job->inputVec.size()) break;
 
-        // If all input items have already been processed, exit the loop
-        if (index >= job->inputVec.size()) {
-            break;
-        }
-
-        // Get the (K1*, V1*) pair at the current index
         auto &pair = job->inputVec[index];
-
-        // Call the user's map function with the key, value, and thread context
-        // The user's implementation is expected to call emit2 from here
         job->client->map(pair.first, pair.second, threadContext);
+
+        // Update MAP progress
+        int done = index + 1;  // optimistic (not atomic accurate but OK for UI)
+        int total = job->inputVec.size();
+        job->jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE, total, done));
     }
 
     sorting_func(threadContext);
-
-    // Pushing the sorted vector into the jobVectors via Mutex
     pushToJobVector(threadContext, job->shuffledVectors, threadContext->intermediateVec);
 
-
-    // Synchronize all threads before shuffle
     job->barrier->barrier();
 
-    // if this is the main thread Continue. The others finished their tasks
     if (threadContext->threadId == MAIN_THREAD_ID) {
-
         shuffling_func(job);
-
     }
-    // All threads wait again before reduce
-    job->barrier->barrier();
 
-    // All threads now enter reduce phase
+    job->barrier->barrier();
     reduce_func(threadContext);
 
     return nullptr;
 }
+
 
 /** Compares two intermediate pairs by key. */
 bool compareIntermediatePairs(const IntermediatePair &a,
@@ -229,13 +214,17 @@ void sorting_func(ThreadContext *context) {
 
 /** Shuffle phase: groups by key, largest to smallest, popping from sorted vectors. */
 void shuffling_func(Job *job) {
-    // Set job state to SHUFFLE_STAGE
-    getJobState(job, &job->jobState);
+    int totalPairs = 0;
+    for (int i = 0; i < job->multiThreadLevel; ++i) {
+        totalPairs += job->threadContexts[i]->intermediateVec->size();
+    }
+
+    int shuffledSoFar = 0;
+    job->jobProgress.store(ENCODE_JOB_PROGRESS(SHUFFLE_STAGE, totalPairs, 0));
 
     while (true) {
         K2 *currentMaxKey = nullptr;
 
-        // Find max key at back of any non-empty vector
         for (int i = 0; i < job->multiThreadLevel; ++i) {
             IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
             if (!vec->empty()) {
@@ -246,9 +235,8 @@ void shuffling_func(Job *job) {
             }
         }
 
-        if (!currentMaxKey) break; // All vectors are empty
+        if (!currentMaxKey) break;
 
-        // Collect all (K2,V2) pairs for currentMaxKey from all threads
         auto *grouped = new IntermediateVec();
         for (int i = 0; i < job->multiThreadLevel; ++i) {
             IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
@@ -257,18 +245,21 @@ void shuffling_func(Job *job) {
                    !(*currentMaxKey < *vec->back().first)) {
                 grouped->push_back(vec->back());
                 vec->pop_back();
-            }
+                   }
         }
 
-        // Only store non-empty groups
         if (!grouped->empty()) {
+            shuffledSoFar += grouped->size();  // progress by number of pairs grouped
             pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->shuffledVectors, grouped);
             job->shuffleGroupCount.fetch_add(1);
+
+            job->jobProgress.store(ENCODE_JOB_PROGRESS(SHUFFLE_STAGE, totalPairs, shuffledSoFar));
         } else {
             delete grouped;
         }
     }
 }
+
 
 /** Compares two K2 keys for equality. */
 bool equalsK2(K2 *a, K2 *b) {
@@ -400,11 +391,11 @@ void getJobState(JobHandle job, JobState *state) {
 /** Reduces the intermediate vectors by calling the user's reduce function. */
 void reduce_func(ThreadContext *context) {
     Job *job = context->job;
+    int totalGroups = job->shuffleGroupCount.load();
 
     while (true) {
         IntermediateVec *vecToReduce = nullptr;
 
-        // Lock and pop one group from the back (LIFO)
         lockMutex(job);
         if (!job->shuffledVectors.empty()) {
             vecToReduce = job->shuffledVectors.back();
@@ -413,15 +404,21 @@ void reduce_func(ThreadContext *context) {
         unlockMutex(job);
 
         if (!vecToReduce) {
-            break; // no more work
+            break;
         }
 
-        // Call the user's reduce function
-        job->client->reduce(vecToReduce, context);
+        if (vecToReduce->empty()) {
+            delete vecToReduce;
+            continue;
+        }
 
-        // Update job progress (optional)
-        // incrementFinishedKeys(job); if you want to track progress here
+        job->client->reduce(vecToReduce, context);
         delete vecToReduce;
+
+        int done = job->reducedGroups.fetch_add(1) + 1;
+        job->jobProgress.store(ENCODE_JOB_PROGRESS(REDUCE_STAGE, totalGroups, done));
     }
 }
+
+
 
