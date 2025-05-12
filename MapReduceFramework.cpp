@@ -1,13 +1,11 @@
 #include "MapReduceFramework.h"
 #include "Barrier.h"
 #include "MapReduceClient.h"
-#include <thread>
 #include <atomic>
 #include <vector>
 #include <iostream>
 #include <pthread.h>
 #include <algorithm>
-#include <queue>
 #include <set>
 
 typedef struct ThreadContext ThreadContext;
@@ -22,6 +20,9 @@ typedef std::set<K2 *, bool (*)(K2 *, K2 *)> SortedSetK2;
 #define MUTEX_INITIALIZED true
 #define MUTEX_NOT_INITIALIZED false
 
+/** Encodes job progress (stage, total, count) into a single 64-bit value:
+ * [2 bits stage | 31 bits total | 31 bits count]
+ * Enables atomic tracking of stage and progress with one variable. */
 #define ENCODE_JOB_PROGRESS(stage, total, count) \
     (((uint64_t)(stage) << STAGE_SHIFT) | ((uint64_t)(total) << TOTAL_SHIFT) | (uint64_t)(count))
 
@@ -34,7 +35,6 @@ struct Job {
     const MapReduceClient *client;       // client to use for the job
     const InputVec &inputVec;            // input vector
     OutputVec &outputVec;                // output vector
-    JobState jobState;                   // contains stage and percentage
     int multiThreadLevel;                // number of threads
     pthread_t *threads;                  // array of thread handles
     ThreadContext **threadContexts;      // array of thread contexts
@@ -43,6 +43,7 @@ struct Job {
     std::atomic<int> shuffleGroupCount;  // for shuffle phase
     std::atomic<int> reducedGroups;      // tracks how many groups reduced
     std::atomic<uint64_t> jobProgress;   // for progress tracking (bit mask)
+    bool waitedForJobBool;       // flag to check if job was waited for
 
     std::vector<IntermediateVec *> shuffledVectors; // Vector of vectors of (K2, V2)
     pthread_mutex_t jobMutex;
@@ -55,7 +56,6 @@ struct Job {
         : client(client),
           inputVec(inputVec),
           outputVec(outputVec),
-          jobState{UNDEFINED_STAGE, 0},
           multiThreadLevel(multiThreadLevel),
           threads(new pthread_t[multiThreadLevel]),
           threadContexts(new ThreadContext *[multiThreadLevel]),
@@ -64,9 +64,9 @@ struct Job {
           shuffleGroupCount(0),
           reducedGroups(0),
           jobProgress(0),
-          shuffledVectors() {}
+          shuffledVectors(),
+          waitedForJobBool(false) {}
 };
-
 
 void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext *context);
@@ -140,8 +140,9 @@ void *threadEntryPoint(void *arg) {
         job->client->map(pair.first, pair.second, threadContext);
 
         // Update MAP progress
-        int done = index + 1;  // optimistic (not atomic accurate but OK for UI)
-        int total = job->inputVec.size();
+        int done =
+            index + 1;  // optimistic (not atomic accurate but OK for UI)
+        uint64_t total = job->inputVec.size();
         job->jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE, total, done));
     }
 
@@ -161,7 +162,6 @@ void *threadEntryPoint(void *arg) {
     return nullptr;
 }
 
-
 /** Compares two intermediate pairs by key. */
 bool compareIntermediatePairs(const IntermediatePair &a,
                               const IntermediatePair &b) {
@@ -176,52 +176,14 @@ void sorting_func(ThreadContext *context) {
         compareIntermediatePairs);
 }
 
-//TODO: implement shuffling_func:
-/** Merges and sorts all intermediate results (main thread only). */
-//void shuffling_func(Job *job) {
-//
-//    // set the job state to shuffle
-//    getJobState(job, SHUFFLE_STAGE);
-//
-//    std::vector<std::vector<IntermediatePair>> mergedVectors;
-//
-//    //get all keys from all intermediate vectors
-//    SortedSetK2 keysSorted = createKeysSorted(job);
-//
-//
-//    for (K2 *key: keysSorted) {
-//        // Create a new IntermediateVec for each unique key
-//        IntermediateVec *vec = new IntermediateVec();
-//        createVectorFromKey(job, key, vec);
-//        // Push the vector to the mergedVectors
-//        mergedVectors.push_back(*vec);
-//    }
-//
-//    // Merge all thread intermediate vectors
-//    for (int i = 0; i < job->multiThreadLevel; ++i) {
-//        IntermediateVec *vec = job->threadContexts[i]->intermediateVec;
-//        merged.insert(merged.end(), vec->begin(), vec->end());
-//    }
-//
-//    // Sort merged vector by key
-//    std::sort(merged.begin(), merged.end(), compareIntermediatePairs);
-//
-//    // Store merged & sorted vector in a new IntermediateVec* (for reduce phase)
-//    auto *sortedVec = new IntermediateVec(std::move(merged));
-//
-//    // Push to job->shuffledVectors as the single reduce input
-//    pushToJobVector(job->threadContexts[MAIN_THREAD_ID], job->shuffledVectors, sortedVec);
-//}
-
-
 /** Shuffle phase: groups by key, largest to smallest, popping from sorted vectors. */
 void shuffling_func(Job *job) {
-    int totalPairs = 0;
+    uint64_t totalPairs = 0;
     for (int i = 0; i < job->multiThreadLevel; ++i) {
         totalPairs += job->threadContexts[i]->intermediateVec->size();
     }
 
-    int shuffledSoFar = 0;
+    uint64_t shuffledSoFar = 0;
     job->jobProgress.store(ENCODE_JOB_PROGRESS(SHUFFLE_STAGE, totalPairs, 0));
 
     while (true) {
@@ -247,7 +209,7 @@ void shuffling_func(Job *job) {
                    !(*currentMaxKey < *vec->back().first)) {
                 grouped->push_back(vec->back());
                 vec->pop_back();
-                   }
+            }
         }
 
         if (!grouped->empty()) {
@@ -256,12 +218,12 @@ void shuffling_func(Job *job) {
             job->shuffleGroupCount.fetch_add(1);
 
             job->jobProgress.store(ENCODE_JOB_PROGRESS(SHUFFLE_STAGE, totalPairs, shuffledSoFar));
-        } else {
+        }
+        else {
             delete grouped;
         }
     }
 }
-
 
 /** Compares two K2 keys for equality. */
 bool equalsK2(K2 *a, K2 *b) {
@@ -285,18 +247,32 @@ void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec) {
     }
 }
 
-// todo: implement
 /** Frees all job resources; destroys mutex if initialized. */
 void freeAll(Job *job, bool isMutexInitialized) {
     // need to free all
-//    bool failed = false;
     if (isMutexInitialized) {
         if (pthread_mutex_destroy(&job->jobMutex) != 0) {
             std::cout << "system error: mutex destroy failed" << std::endl;
-//            failed = true;
+        }
+    }
+    // Free any dynamically allocated intermediate vectors
+    for (auto vec: job->shuffledVectors) {
+        delete vec;  // Ensure that we delete all intermediate vectors created during shuffle
+    }
+    job->shuffledVectors.clear();
+
+    if (job->threadContexts != nullptr) {
+        // Free the threads and their contexts
+        for (int i = 0; i < job->multiThreadLevel; ++i) {
+            if (job->threadContexts[i] != nullptr) {
+                delete job->threadContexts[i];  // Free each thread context
+            }
         }
     }
 
+    delete[] job->threads;  // Free the array of threads
+    delete[] job->threadContexts;  // Free the array of thread contexts
+    delete job->barrier;  // Free the barrier object
 }
 
 /** Locks the job's mutex or exits on failure. */
@@ -335,18 +311,18 @@ void emit3(K3 *key, V3 *value, void *context) {
 
 }
 
-//TODO: implement waitForJob:
 /** Waits for all threads to finish and frees thread contexts. */
 void waitForJob(JobHandle jobHandle) {
     auto *job = (Job *) (jobHandle);
+
+    // Can wait for job only once for each job
+    if (job->waitedForJobBool) {
+        return;
+    }
+    job->waitedForJobBool = true;
     for (int i = 0; i < job->multiThreadLevel; ++i) {
         pthread_join(job->threads[i], nullptr);
-        delete job->threadContexts[i];
     }
-    delete[] job->threads;
-    delete[] job->threadContexts;
-    delete job->barrier;
-    delete job;
 }
 
 /** Closes and frees all job-related resources. */
@@ -384,10 +360,6 @@ void getJobState(JobHandle job, JobState *state) {
     int total = DECODE_TOTAL(x);
     int done = DECODE_FINISHED(x);
     state->percentage = total == 0 ? 0 : ((float) done / total) * 100.0f;
-//
-//    // Update the job's state
-//    j->jobState.stage = state->stage;
-//    j->jobState.percentage = state->percentage;
 }
 
 /** Reduces the intermediate vectors by calling the user's reduce function. */
@@ -421,6 +393,4 @@ void reduce_func(ThreadContext *context) {
         job->jobProgress.store(ENCODE_JOB_PROGRESS(REDUCE_STAGE, totalGroups, done));
     }
 }
-
-
 
