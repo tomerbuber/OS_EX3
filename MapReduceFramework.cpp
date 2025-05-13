@@ -1,6 +1,5 @@
 /**
  * TODO list:
- *    1) change freeAll to look more distinguished - maaya
  *    2) Pass mattanTests - tombu
  *    3) Implement reset timer where needed - maaya
  */
@@ -13,19 +12,20 @@
 #include <iostream>
 #include <pthread.h>
 #include <algorithm>
-#include <set>
 
-typedef struct ThreadContext ThreadContext;
-typedef std::set<K2 *, bool (*)(K2 *, K2 *)> SortedSetK2;
+#define SUCCESS 0
+#define ERROR (-1)
+#define MAIN_THREAD_ID 0
+#define MUTEX_INITIALIZED true
+#define MUTEX_NOT_INITIALIZED false
 
 #define STAGE_SHIFT 62
 #define TOTAL_SHIFT 31
 #define COUNT_MASK 0x7fffffff
-#define ERROR (-1)
-#define SUCCESS 0
-#define MAIN_THREAD_ID 0
-#define MUTEX_INITIALIZED true
-#define MUTEX_NOT_INITIALIZED false
+
+#define DECODE_STAGE(x) ((stage_t)((x) >> STAGE_SHIFT))
+#define DECODE_TOTAL(x) (((x) >> TOTAL_SHIFT) & COUNT_MASK)
+#define DECODE_FINISHED(x) ((x) & COUNT_MASK)
 
 /** Encodes job progress (stage, total, count) into a single 64-bit value:
  * [2 bits stage | 31 bits total | 31 bits count]
@@ -33,9 +33,7 @@ typedef std::set<K2 *, bool (*)(K2 *, K2 *)> SortedSetK2;
 #define ENCODE_JOB_PROGRESS(stage, total, count) \
     (((uint64_t)(stage) << STAGE_SHIFT) | ((uint64_t)(total) << TOTAL_SHIFT) | (uint64_t)(count))
 
-#define DECODE_STAGE(x) ((stage_t)((x) >> STAGE_SHIFT))
-#define DECODE_TOTAL(x) (((x) >> TOTAL_SHIFT) & COUNT_MASK)
-#define DECODE_FINISHED(x) ((x) & COUNT_MASK)
+typedef struct ThreadContext ThreadContext;
 
 /** Job structure holding all data and sync tools for MapReduce. */
 struct Job {
@@ -51,7 +49,6 @@ struct Job {
     std::atomic<int> reducedGroups;      // tracks how many groups reduced
     std::atomic<uint64_t> jobProgress;   // for progress tracking (bit mask)
     bool waitedForJobBool;       // flag to check if job was waited for
-
     std::vector<IntermediateVec *> shuffledVectors; // Vector of vectors of (K2, V2)
     pthread_mutex_t jobMutex;
 
@@ -78,15 +75,13 @@ struct Job {
 void *threadEntryPoint(void *arg);
 void sorting_func(ThreadContext *context);
 void shuffling_func(Job *job);
-SortedSetK2 createKeysSorted(Job *job);
-bool compareIntermediatePairs(const IntermediatePair &a, const
-IntermediatePair &b);
+bool compareIntermediatePairs(const IntermediatePair &a,
+                              const IntermediatePair &b);
 void freeAll(Job *job, bool isMutexInitialized);
 void lockMutex(Job *job);
 void unlockMutex(Job *job);
 void reduce_func(ThreadContext *context);
 
-void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec);
 struct ThreadContext {
     const int threadId;
     Job *job;
@@ -153,16 +148,17 @@ void *threadEntryPoint(void *arg) {
         job->jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE, total, done));
     }
 
-    // Wait for all threads to finish the map phase
     sorting_func(threadContext);
     pushToJobVector(threadContext, job->shuffledVectors, threadContext->intermediateVec);
 
+    // Wait for all threads to finish the map phase
     job->barrier->barrier();
 
     if (threadContext->threadId == MAIN_THREAD_ID) {
         shuffling_func(job);
     }
 
+    // Wait for main thread to finish shuffling
     job->barrier->barrier();
     reduce_func(threadContext);
 
@@ -232,23 +228,12 @@ void shuffling_func(Job *job) {
     }
 }
 
-/** Compares two K2 keys for equality. */
-bool equalsK2(K2 *a, K2 *b) {
-    return !((*a < *b) && (*b < *a));
-}
-
-void createVectorFromKey(Job *job, K2 *k2, IntermediateVec *afterShuffleVec) {
-    // Iterate through all intermediate vectors and find the matching key
-    for (int i = 0; i < job->multiThreadLevel; ++i) {
-        IntermediateVec *intermediateVec = job->shuffledVectors[i];
-        for (const auto &pair: *intermediateVec) {
-
-            if (equalsK2(pair.first, k2)) {
-                afterShuffleVec->push_back(pair);
-            }
-            if (*k2 < *(pair.first)) {
-                // No need to check further, as the keys are sorted
-                break;
+void deleteThreadContexts(Job *job) {
+    if (job->threadContexts != nullptr) {
+        // Free the threads and their contexts
+        for (int i = 0; i < job->multiThreadLevel; ++i) {
+            if (job->threadContexts[i] != nullptr) {
+                delete job->threadContexts[i];  // Free each thread context
             }
         }
     }
@@ -268,14 +253,7 @@ void freeAll(Job *job, bool isMutexInitialized) {
     }
     job->shuffledVectors.clear();
 
-    if (job->threadContexts != nullptr) {
-        // Free the threads and their contexts
-        for (int i = 0; i < job->multiThreadLevel; ++i) {
-            if (job->threadContexts[i] != nullptr) {
-                delete job->threadContexts[i];  // Free each thread context
-            }
-        }
-    }
+    deleteThreadContexts(job);
 
     delete[] job->threads;  // Free the array of threads
     delete[] job->threadContexts;  // Free the array of thread contexts
@@ -337,26 +315,6 @@ void closeJobHandle(JobHandle job) {
     waitForJob(job);
     auto *j = (Job *) job;
     freeAll(j, MUTEX_INITIALIZED);
-}
-
-/** Comparator function for sorting K2* keys by value. */
-bool k2Comparator(K2 *a, K2 *b) {
-    return *a < *b;
-}
-
-/** Creates a sorted set of unique keys from intermediate vectors. */
-SortedSetK2 createKeysSorted(Job *job) {
-    // Create a set to store unique keys, sorted by the comparator function ptr
-    SortedSetK2 keysSorted(k2Comparator);
-
-    // Iterate through all intermediate vectors and insert keys into the set
-    for (int i = 0; i < job->multiThreadLevel; ++i) {
-        for (auto &pair: *job->shuffledVectors[i]) {
-            keysSorted.insert(pair.first);
-        }
-    }
-
-    return keysSorted;
 }
 
 /** Gets the current job state and updates the job's state. */
