@@ -20,3 +20,21 @@ MapReduceFramework.h
         Barrier/Barrier.cpp
         "Sample Client/SampleClient.cpp")
 
+add_executable(test1_1thread
+test1-1_thread_1_process.cpp
+    MapReduceFramework.cpp
+        MapReduceClient.h
+        MapReduceFramework.h
+        Barrier/Barrier.h
+        Barrier/Barrier.cpp)
+
+add_executable(test1_4thread
+        test4-1_thread_4_process.cpp
+        MapReduceFramework.cpp
+        MapReduceClient.h
+        MapReduceFramework.h
+        Barrier/Barrier.h
+        Barrier/Barrier.cpp)
+
+
+
