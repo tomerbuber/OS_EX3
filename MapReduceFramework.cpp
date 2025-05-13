@@ -1,3 +1,10 @@
+/**
+ * TODO list:
+ *    1) change freeAll to look more distinguished - maaya
+ *    2) Pass mattanTests - tombu
+ *    3) Implement reset timer where needed - maaya
+ */
+
 #include "MapReduceFramework.h"
 #include "Barrier.h"
 #include "MapReduceClient.h"
