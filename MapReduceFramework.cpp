@@ -48,6 +48,7 @@ struct Job {
     std::atomic<int> shuffleGroupCount;  // for shuffle phase
     std::atomic<int> reducedGroups;      // tracks how many groups reduced
     std::atomic<uint64_t> jobProgress;   // for progress tracking (bit mask)
+    std::atomic<int> mappedInputsCount;
     bool waitedForJobBool;       // flag to check if job was waited for
     std::vector<IntermediateVec *> shuffledVectors; // Vector of vectors of (K2, V2)
     pthread_mutex_t jobMutex;
@@ -67,9 +68,14 @@ struct Job {
           atomicIndex(0),
           shuffleGroupCount(0),
           reducedGroups(0),
-          jobProgress(0),
+          mappedInputsCount(0),
           shuffledVectors(),
-          waitedForJobBool(false) {}
+          waitedForJobBool(false) {
+        // Initialize the job progress to 0
+        jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE,
+                                                   multiThreadLevel, 0));
+
+    }
 };
 
 void *threadEntryPoint(void *arg);
@@ -120,7 +126,7 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
                            nullptr,
                            threadEntryPoint,
                            job->threadContexts[i]) != 0) {
-            std::cerr << "system error: failed to create thread\n";
+//            std::cerr << "system error: failed to create thread\n";
             exit(ERROR);
         }
     }
@@ -142,10 +148,13 @@ void *threadEntryPoint(void *arg) {
         job->client->map(pair.first, pair.second, threadContext);
 
         // Update MAP progress
-        int done =
-            index + 1;  // optimistic (not atomic accurate but OK for UI)
+        int done = job->mappedInputsCount.fetch_add(1) + 1;
         uint64_t total = job->inputVec.size();
+        uint64_t expected = job->jobProgress.load();
+
         job->jobProgress.store(ENCODE_JOB_PROGRESS(MAP_STAGE, total, done));
+//        std::cout << "done: " << done << ::std::endl;
+
     }
 
     sorting_func(threadContext);
@@ -324,6 +333,7 @@ void getJobState(JobHandle job, JobState *state) {
     state->stage = DECODE_STAGE(x);
     int total = DECODE_TOTAL(x);
     int done = DECODE_FINISHED(x);
+//    std::cout<<"Stage: "<<state->stage<<" total: "<<total<<" done: "<<done<<std::endl;
     state->percentage = total == 0 ? 0 : ((float) done / total) * 100.0f;
 }
 
